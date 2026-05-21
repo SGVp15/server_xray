@@ -154,10 +154,12 @@ chmod +x /usr/local/bin/mainuser
 touch /usr/local/bin/newuser
 cat << 'EOF' > /usr/local/bin/newuser
 #!/bin/bash
+
+# 1. Проверяем аргументы или запрашиваем ввод
 if [[ -n "$1" ]]; then
-        email="$1"
+    email="$1"
 else
-        read -p "Введите имя пользователя (email): " email
+    read -p "Введите имя пользователя (email): " email
 fi
 
 if [[ -z "$email" || "$email" == *" "* ]]; then
@@ -165,40 +167,63 @@ if [[ -z "$email" || "$email" == *" "* ]]; then
     exit 1
 fi
 
-user_json=$(jq --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
+CONFIG_PATH="/usr/local/etc/xray/config.json"
+KEYS_PATH="/usr/local/etc/xray/.keys"
 
-if [[ -z "$user_json" ]]; then
+# Проверяем наличие файлов, чтобы jq не падал с ошибкой
+if [[ ! -f "$CONFIG_PATH" ]]; then
+    echo "Ошибка: Конфигурационный файл Xray не найден по пути $CONFIG_PATH"
+    exit 1
+fi
+
+# 2. Проверяем, существует ли пользователь
+user_exists=$(jq --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email)' "$CONFIG_PATH")
+
+if [[ -n "$user_exists" ]]; then
+    echo "Пользователь с именем $email уже существует."
+    # Если нужно просто показать его ссылку, убираем exit 1.
+    # Но логичнее завершить работу, раз мы добавляем пользователя.
+    exit 1
+fi
+
+# 3. Генерируем UUID и добавляем пользователя в конфиг
 uuid=$(xray uuid)
-jq --arg email "$email" --arg uuid "$uuid" '.inbounds[0].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' /usr/local/etc/xray/config.json > tmp.json && mv >
+if jq --arg email "$email" --arg uuid "$uuid" '.inbounds[0].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' "$CONFIG_PATH" > tmp.json; then
+    mv tmp.json "$CONFIG_PATH"
+else
+    echo "Ошибка при изменении конфигурационного файла."
+    rm -f tmp.json
+    exit 1
+fi
 
+# 4. Перезапускаем Xray
 systemctl restart xray
 
-index=$(jq --arg email "$email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password/ {print $2}')
-sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
+# 5. Собираем все данные ОДНИМ запросом jq (для скорости и стабильности)
+read -r protocol port sni <<< $(jq -r '.inbounds[0].protocol + " " + (.inbounds[0].port|to_string) + " " + .inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG_PATH")
 
+# Извлекаем ключи
+pbk=$(awk -F': ' '/Password/ {print $2}' "$KEYS_PATH")
+sid=$(awk -F': ' '/shortsid/ {print $2}' "$KEYS_PATH")
+
+# Получаем IP (добавлен таймаут, чтобы скрипт не завис, если сайт лежит)
+ip=$(curl -4 -s --connect-timeout 5 icanhazip.com)
+
+# 6. Формируем ссылку
+link="${protocol}://${uuid}@${ip}:${port}?security=reality&sni=${sni}&fp=firefox&pbk=${pbk}&sid=${sid}&spx=%2F&type=tcp&flow=xtls-rprx-vision&encryption=none#${email}"
+
+# 7. Вывод и сохранение результатов
 echo ""
-echo "Ссылка для подключения":
+echo "Ссылка для подключения:"
 echo "$link"
 echo ""
 echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
+echo "${link}" | qrencode -t ansiutf8
 
-        mkdir -p /root/confs/
-        mkdir -p /root/qr/
-        echo "${link}" | qrencode -o /root/qr/$email.png
-        echo "$link" > /root/confs/$email.txt
-
-else
-echo "Пользователь с таким именем уже существует. Попробуйте снова."
-
+mkdir -p /root/confs/
+mkdir -p /root/qr/
+echo "${link}" | qrencode -o "/root/qr/${email}.png"
+echo "$link" > "/root/confs/${email}.txt"
 EOF
 chmod +x /usr/local/bin/newuser
 
